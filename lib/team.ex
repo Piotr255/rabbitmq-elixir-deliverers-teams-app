@@ -1,6 +1,7 @@
 defmodule Team do
   use GenServer
   @exchange_name "orders"
+  @teams_exchange "teams"
 
   def start_link(options) do
     GenServer.start_link(__MODULE__, options, name: elem(options, 0))
@@ -10,13 +11,21 @@ defmodule Team do
   def init(options) do
     {team_name} = options
     team_name = Atom.to_string(team_name)
+
     {:ok, connection} = AMQP.Connection.open()
     {:ok, channel} = AMQP.Channel.open(connection)
+
     AMQP.Queue.declare(channel, team_name)
-    AMQP.Exchange.declare(channel, @exchange_name, :direct)
+    AMQP.Exchange.declare(channel, @exchange_name, :topic)
+
+    AMQP.Exchange.declare(channel, @teams_exchange, :fanout)
+    {:ok, %{queue: queue_name}} = AMQP.Queue.declare(channel, "", exclusive: true)
+    AMQP.Queue.bind(channel, queue_name, @teams_exchange)
 
     AMQP.Queue.bind(channel, team_name, @exchange_name, routing_key: team_name)
     AMQP.Basic.consume(channel, team_name, self(), no_ack: true)
+    AMQP.Basic.consume(channel, queue_name, self())
+
     IO.puts(" [x] Waiting for orders' answers. To exit press CTRL+C")
     {:ok, %{channel: channel, team_name: team_name, connection: connection}}
   end
@@ -28,7 +37,17 @@ defmodule Team do
   @impl true
   def handle_cast({:send, product_name}, state) do
     IO.puts(" [x] Sending order for #{product_name}")
-    AMQP.Basic.publish(state.channel, @exchange_name, product_name, state.team_name)
+    message = state.team_name
+    AMQP.Basic.publish(state.channel, @exchange_name, product_name, message)
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(
+        {:basic_deliver, payload, %{exchange: @teams_exchange} = _meta},
+        state
+      ) do
+    IO.puts(" [x] [#{state.team_name}] [admin message] Received: #{payload}")
     {:noreply, state}
   end
 

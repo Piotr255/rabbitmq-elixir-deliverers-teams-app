@@ -1,14 +1,15 @@
 defmodule Deliverer do
   use GenServer
   @exchange_name "orders"
+  @deliverers_exchange "deliverers"
 
   def start_link(options) do
     GenServer.start_link(__MODULE__, options, name: elem(options, 0))
   end
 
-  def send_message(state, routing_key) do
+  def send_message(state, routing_key, product) do
     Process.sleep(2000)
-    order_id = "#{state.id}|#{routing_key}|#{state.deliver_name}"
+    order_id = "#{state.id}|#{product}|#{routing_key}|#{state.deliver_name}"
     IO.puts(" [x] Delivering order #{order_id}")
 
     AMQP.Basic.publish(
@@ -27,12 +28,17 @@ defmodule Deliverer do
     {:ok, connection} = AMQP.Connection.open()
     {:ok, channel} = AMQP.Channel.open(connection)
 
-    AMQP.Exchange.declare(channel, @exchange_name, :direct)
+    AMQP.Exchange.declare(channel, @exchange_name, :topic)
 
     for item <- items_to_sell do
       AMQP.Queue.declare(channel, item)
       AMQP.Queue.bind(channel, item, @exchange_name, routing_key: item)
     end
+
+    AMQP.Exchange.declare(channel, @deliverers_exchange, :fanout)
+    {:ok, %{queue: queue_name}} = AMQP.Queue.declare(channel, "", exclusive: true)
+    AMQP.Queue.bind(channel, queue_name, @deliverers_exchange)
+    AMQP.Basic.consume(channel, queue_name, self())
 
     AMQP.Basic.qos(channel, prefetch_count: 1)
 
@@ -52,12 +58,21 @@ defmodule Deliverer do
   end
 
   @impl true
+  def handle_info(
+        {:basic_deliver, payload, %{exchange: @deliverers_exchange} = _meta},
+        state
+      ) do
+    IO.puts(" [x] [#{state.deliver_name}] [admin message] Received: #{payload}")
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info({:basic_deliver, payload, meta}, state) do
     IO.puts(
       " [x] [#{state.deliver_name}] Received order for: #{payload}, exchange: #{meta.exchange}, routing_key: #{meta.routing_key}"
     )
 
-    new_state = send_message(state, payload)
+    new_state = send_message(state, payload, meta.routing_key)
     AMQP.Basic.ack(state.channel, meta.delivery_tag)
     {:noreply, new_state}
   end
